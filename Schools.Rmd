@@ -1,0 +1,541 @@
+---
+title: "Primary Schools: Access, Voronoi & Spatial Competition"
+author: "Norbert Jaworski"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  data_dir: "data"
+  city_name: "Warsaw, Poland"
+  crs_metric: 2180
+  crs_geo: 4326
+  medoid_threshold_m: 200
+  candidate_border_buffer_m: 50
+  n_top_tiles: 7
+  n_points_per_tile: 3
+  gensa_max_calls: 500
+  cache_chunks: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = params$cache_chunks
+)
+options(scipen = 999)
+set.seed(42)
+```
+
+# 1. Dependencies
+
+```{r packages}
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+
+pkgs <- c(
+  "sf","dplyr","tidyr","osmdata","spdep","spatstat.geom","RColorBrewer",
+  "units","igraph","purrr","readr","stringr","GenSA","future","future.apply","lhs"
+)
+install_if_missing(pkgs)
+
+lapply(pkgs, function(p) suppressPackageStartupMessages(library(p, character.only = TRUE)))
+
+future::plan(future::multisession)
+```
+
+# 2. Paths, CRS & OSM context
+
+```{r paths-crs-osm}
+DATA_DIR   <- params$data_dir
+CRS_METRIC <- params$crs_metric
+CRS_GEO    <- params$crs_geo
+
+# Boundaries
+POW <- st_read(file.path(DATA_DIR, "powiaty/powiaty.shp"), stringsAsFactors = FALSE)
+POW$jpt_nazwa_ <- iconv(POW$jpt_nazwa_, "latin1", "UTF-8")
+POW <- st_transform(POW, CRS_GEO)
+POW_waw <- POW[POW$jpt_nazwa_ == "powiat Warszawa",]
+
+WAW <- st_read(file.path(DATA_DIR, "dzielnice_Warszawy/dzielnice_Warszawy.shp")) %>%
+  st_transform(CRS_GEO)
+
+POP_WAW <- st_read(file.path(DATA_DIR, "POP.WAW/POP.WAW.shp"))
+
+# OSM context
+warsaw_bbox <- getbb(params$city_name)
+river <- warsaw_bbox %>% opq() %>% add_osm_feature(key="waterway", value="river") %>% osmdata_sf()
+railway <- warsaw_bbox %>% opq() %>% add_osm_feature(key="railway", value="rail") %>% osmdata_sf()
+```
+
+# 3. Utilities
+
+```{r utils}
+# Medoid merge for de-duplicating clustered points
+merge_points_medoid <- function(points_sf, threshold_m = 100, metric_crs = CRS_METRIC, output_crs = CRS_GEO) {
+  if (is.null(points_sf) || nrow(points_sf) == 0) return(points_sf)
+  pts_m  <- st_transform(points_sf, metric_crs)
+  D      <- st_distance(pts_m)
+  thr    <- units::set_units(threshold_m, "m")
+  adj    <- (D < thr) & (D > units::set_units(0, "m"))
+  g      <- igraph::graph_from_adjacency_matrix(as.matrix(adj), mode = "undirected", diag = FALSE)
+  memb   <- igraph::components(g)$membership
+  pts_m$cluster <- memb
+  keep <- c()
+  for (cl in sort(unique(memb))) {
+    idx <- which(pts_m$cluster == cl)
+    if (length(idx) == 1) keep <- c(keep, idx) else {
+      sub <- as.matrix(D[idx, idx])
+      keep <- c(keep, idx[which.min(rowSums(sub))])
+    }
+  }
+  st_transform(pts_m[unique(keep), ], output_crs)
+}
+
+# Spatially weighted HHI from voronoi tiles (pop 0-14)
+compute_spatially_weighted_hhi <- function(vor_sf, id_col = "school_id") {
+  # Inputs: vor_sf must have pop_tile (numeric), geometry; id_col labels provider (school)
+  Pi <- as.numeric(vor_sf$pop_tile)          # population per tile
+  Ai <- as.numeric(st_area(vor_sf)) / 1e6    # km^2
+  Pi[is.na(Pi)] <- 0
+  Ai[!is.finite(Ai) | Ai <= 0] <- 1e-4
+
+  # Spatial weights from density
+  pi <- Pi / Ai
+  denom_w <- sum(pi, na.rm = TRUE)
+  wi <- if (!is.finite(denom_w) || denom_w == 0) rep(1/length(pi), length(pi)) else pi / denom_w
+
+  # Market shares by population
+  Ptot <- sum(Pi, na.rm = TRUE)
+  ms <- if (!is.finite(Ptot) || Ptot == 0) rep(0, length(Pi)) else Pi / Ptot
+
+  # Tile-level spatially weighted share
+  S_i <- ms * wi
+  denom_s <- sum(S_i, na.rm = TRUE)
+  if (is.finite(denom_s) && denom_s > 0) S_i <- S_i / denom_s
+  vor_sf$spatially_weighted_share <- S_i
+
+  # Diagnostics: HHI over tiles (not economically meaningful, but useful)
+  hhi_tile <- sum(S_i^2, na.rm = TRUE)
+
+  # Correct HHI: aggregate S_i by provider (school), then square and sum
+  if (id_col %in% names(vor_sf)) {
+    prov <- vor_sf |>
+      st_drop_geometry() |>
+      dplyr::group_by(.data[[id_col]]) |>
+      dplyr::summarise(S = sum(spatially_weighted_share, na.rm = TRUE), .groups = "drop")
+    hhi_school <- sum(prov$S^2, na.rm = TRUE)
+  } else {
+    hhi_school <- NA_real_
+  }
+
+  # Keep legacy name so existing code keeps working
+  list(
+    vor_sf = vor_sf,
+    hhi_spatial_weighted = hhi_school,  # alias for provider-level HHI
+    hhi_school = hhi_school,
+    hhi_tile = hhi_tile
+  )
+}
+
+
+```
+
+# 4. School POIs (Primary) from OSM
+
+```{r schools-osm}
+# Helper: read WKT CSV -> sf, set CRS, align to WAW CRS, clip to WAW
+read_wkt_points <- function(path, waw = WAW) {
+  df  <- readr::read_csv(path, col_types = readr::cols(.default = readr::col_character()))
+  pts <- sf::st_as_sf(df, wkt = "WKT", crs = 4326)   # OSM = EPSG:4326
+
+  # --- normalize geometry column name to 'geometry'
+  pts <- dplyr::rename(pts, geometry = WKT)
+  sf::st_geometry(pts) <- "geometry"
+
+  # align CRS to WAW for clipping
+  pts <- sf::st_transform(pts, sf::st_crs(waw))
+  sf::st_intersection(pts, waw)
+}
+
+# --- Usage (adjust the file name to yours) ---
+# Example: saved earlier via st_write(..., layer_options="GEOMETRY=AS_WKT")
+# e.g., "data/schools_points_wkt.csv"
+primary_school_medoids <- get_primary_school_points_from_wkt(
+  path   = "data/school_points_wkt.csv",
+  waw_sf = WAW
+)
+
+stopifnot(!is.null(primary_school_medoids), nrow(primary_school_medoids) > 0)
+```
+
+# 5. Voronoi Tessellation
+
+```{r voronoi}
+get_voronoi <- function(points_sf, boundary_sf, crs_metric = CRS_METRIC) {
+  pts <- st_transform(points_sf, crs_metric)
+  boundary <- st_transform(boundary_sf, crs_metric)
+  env <- st_union(boundary)
+  vg <- pts %>% st_geometry() %>% st_union() %>% st_voronoi(envelope = st_geometry(env))
+  polys <- st_collection_extract(vg, "POLYGON") %>% st_sf(crs = st_crs(boundary))
+  st_intersection(polys, boundary) %>% mutate(tile_id = dplyr::row_number(), tile_area = st_area(geometry))
+}
+
+VOR_2180 <- get_voronoi(primary_school_medoids, POW_waw)
+```
+
+# 6. Population Overlay (0–14)
+
+```{r population-overlay}
+get_tile_population <- function(voronoi_sf, pop_grid_sf, crs_metric = CRS_METRIC) {
+  POP_2180 <- st_transform(pop_grid_sf, crs_metric) %>% mutate(cell_id = dplyr::row_number(), cell_area = st_area(geometry))
+  VOR_2180 <- st_transform(voronoi_sf, crs_metric)
+  pop_vor <- st_intersection(POP_2180, VOR_2180) %>% mutate(sub_area = st_area(geometry), pop_share = RES_0_14 * (sub_area / cell_area))
+  pop_per_tile <- pop_vor %>% st_drop_geometry() %>% group_by(tile_id) %>% summarise(pop_tile = sum(pop_share, na.rm = TRUE))
+  VOR_2180 <- VOR_2180 %>% left_join(pop_per_tile, by = "tile_id") %>%
+    mutate(tile_area = st_area(geometry), cell_area_km2 = as.numeric(tile_area) / 1e6, pop_density = as.numeric(pop_tile) / cell_area_km2)
+  VOR_2180
+}
+
+VOR_2180 <- get_tile_population(VOR_2180, POP_WAW)
+```
+
+# 7. Assign School IDs & Market Shares
+
+```{r shares}
+assign_school_ids <- function(vor_sf, points_sf) {
+  pts <- st_transform(points_sf, st_crs(vor_sf))
+  pts$school_id <- seq_len(nrow(pts))
+  st_join(vor_sf, pts %>% dplyr::select(school_id), join = st_contains)
+}
+
+VOR_2180 <- assign_school_ids(VOR_2180, primary_school_medoids)
+
+get_market_shares <- function(vor_sf) {
+  total_pop <- sum(vor_sf$pop_tile, na.rm = TRUE)
+  school_shares <- vor_sf %>% st_drop_geometry() %>% group_by(school_id) %>% summarise(pop_tile = sum(pop_tile, na.rm = TRUE), .groups = "drop") %>% mutate(market_share = pop_tile / total_pop)
+  list(vor_sf = vor_sf %>% left_join(school_shares, by = "school_id"), school_shares = school_shares)
+}
+
+market_out <- get_market_shares(VOR_2180)
+VOR_2180 <- market_out$vor_sf
+school_shares <- market_out$school_shares
+```
+
+# 8. Spatially Weighted HHI (before)
+
+```{r hhi-before}
+# 8. Spatially Weighted HHI — Baseline (area-weighted & geometry-safe)
+# Ensure VOR_2180 has tile_id and is in metric CRS
+VOR_2180 <- VOR_2180 %>%
+  st_transform(CRS_METRIC)
+if (!"tile_id" %in% names(VOR_2180)) {
+  VOR_2180$tile_id <- seq_len(nrow(VOR_2180))
+}
+
+# Load population grid in metric CRS and pick population field (prefer 0–14)
+POP_WAW_2180 <- st_read(file.path(params$data_dir, "POP.WAW/POP.WAW.shp")) %>%
+  st_transform(CRS_METRIC)
+
+if ("RES_0_14" %in% names(POP_WAW_2180)) {
+  pop_field <- "RES_0_14"
+} else if ("RES" %in% names(POP_WAW_2180)) {
+  pop_field <- "RES"
+} else {
+  stop("POP.WAW shapefile lacks RES_0_14/RES field.")
+}
+
+# Area-weighted overlay: each grid cell contributes proportionally to overlap
+POP_2180 <- POP_WAW_2180 %>%
+  mutate(cell_id = dplyr::row_number(), cell_area = st_area(geometry))
+
+pop_vor <- st_intersection(POP_2180, VOR_2180) %>%
+  mutate(
+    sub_area  = st_area(geometry),
+    pop_share = .data[[pop_field]] * (sub_area / cell_area)
+  )
+
+# Summarize total population per Voronoi tile (keep tile_id!)
+pop_per_tile <- pop_vor %>%
+  st_drop_geometry() %>%
+  group_by(tile_id) %>%
+  summarise(pop_tile = sum(pop_share, na.rm = TRUE), .groups = "drop")
+
+# Join back to Voronoi tiles without dropping geometry
+VOR_2180 <- VOR_2180 %>%
+  left_join(pop_per_tile, by = "tile_id")
+
+# Safety: replace missing pop_tile with 0
+VOR_2180$pop_tile[is.na(VOR_2180$pop_tile)] <- 0
+
+# Compute spatially weighted HHI (keeps geometry)
+sw_before <- compute_spatially_weighted_hhi(VOR_2180)
+VOR_2180  <- sw_before$vor_sf
+cat("Spatially weighted HHI (before):", round(sw_before$hhi_spatial_weighted, 6), "\n")
+
+```
+
+# 9. Visualization — Spatially Weighted Shares
+
+```{r viz-map, fig.width=10, fig.height=7}
+plot_market_share_map <- function(vor_sf, school_pts, pow_sf) {
+  VOR_4326 <- st_transform(vor_sf, CRS_GEO)
+  school_pts_wgs <- st_transform(st_as_sf(school_pts), CRS_GEO)
+  share_vals <- VOR_4326$spatially_weighted_share
+  n_breaks <- 6
+  share_breaks <- seq(min(share_vals, na.rm = TRUE), max(share_vals, na.rm = TRUE), length.out = n_breaks + 1)
+  share_colors <- colorRampPalette(c("yellow", "purple"))(n_breaks)
+  VOR_4326$color <- cut(VOR_4326$spatially_weighted_share, breaks = share_breaks, labels = share_colors, include.lowest = TRUE)
+  plot(st_geometry(pow_sf), col = "white", border = "gray30", lwd = 1.5, main = "Primary Schools — Spatially Weighted Share (0–14)")
+  plot(st_geometry(VOR_4326), col = as.character(VOR_4326$color), border = "black", lwd = 1.2, add = TRUE)
+  plot(st_geometry(school_pts_wgs), col = "black", bg = "green", pch = 21, cex = 1.3, add = TRUE)
+  plot(st_geometry(river$osm_lines), col = "steelblue1", lwd = 3, add = TRUE)
+  plot(st_geometry(railway$osm_lines), col = "gray", lwd = 1, add = TRUE)
+  legend("bottomleft", legend = paste0(round(share_breaks[-length(share_breaks)], 5), " to ", round(share_breaks[-1], 5)), fill = share_colors, title = "Spatially Weighted Share", bty = "n", cex = 0.8)
+}
+
+plot_market_share_map(VOR_2180, primary_school_medoids, POW_waw)
+```
+
+# 10. Candidate Generation (Top Tiles + LHS Sampling)
+
+```{r candidates}
+# Top tiles
+n_top_tiles <- params$n_top_tiles
+n_points_per_tile <- params$n_points_per_tile
+
+top_tiles <- VOR_2180 %>%
+  arrange(desc(market_share)) %>%
+  slice_head(n = n_top_tiles)
+if (nrow(top_tiles) == 0) stop("No top tiles available — check that market_share was computed.")
+
+# Helpers expect SFC (not SFG) and preserve CRS
+remove_near_border <- function(tile_sfc, pts, min_dist = params$candidate_border_buffer_m) {
+  # tile_sfc: sfc with 1 polygon; pts: sf points
+  tile_sf <- st_transform(st_as_sf(tile_sfc), CRS_METRIC)
+  pts     <- st_transform(pts, CRS_METRIC)
+  dists   <- st_distance(pts, st_boundary(tile_sf))
+  thr     <- units::set_units(min_dist, "m")
+  pts[as.numeric(dists) > as.numeric(thr), , drop = FALSE]
+}
+
+sample_lhs_points <- function(poly_sfc, n) {
+  # poly_sfc: sfc with 1 polygon
+  poly_sf <- st_as_sf(poly_sfc)
+  bb <- st_bbox(poly_sf)
+  lhs_norm <- lhs::randomLHS(n, 2)
+  xs <- as.numeric(bb["xmin"]) + lhs_norm[,1] * (as.numeric(bb["xmax"]) - as.numeric(bb["xmin"]))
+  ys <- as.numeric(bb["ymin"]) + lhs_norm[,2] * (as.numeric(bb["ymax"]) - as.numeric(bb["ymin"]))
+  pts_sf <- st_as_sf(data.frame(x = xs, y = ys), coords = c("x", "y"), crs = st_crs(poly_sf))
+  inside <- st_within(pts_sf, poly_sf, sparse = FALSE)[,1]
+  pts_sf[inside, , drop = FALSE]
+}
+
+candidate_points <- do.call(rbind, lapply(seq_len(nrow(top_tiles)), function(i) {
+  # Work with SFC (keeps CRS); avoid extracting SFG directly
+  tile_sfc <- st_geometry(st_transform(top_tiles[i, ], CRS_METRIC))  # sfc length 1
+  crs_tile <- st_crs(tile_sfc)
+
+  candidates <- sample_lhs_points(tile_sfc, n_points_per_tile * 2)
+  candidates <- remove_near_border(tile_sfc, candidates, min_dist = params$candidate_border_buffer_m)
+
+  if (nrow(candidates) > n_points_per_tile) {
+    candidates <- candidates[1:n_points_per_tile, , drop = FALSE]
+  }
+
+  if (nrow(candidates) > 0) {
+    pts_sf <- st_sf(tile_id = top_tiles$tile_id[i], geometry = st_geometry(candidates))
+    st_crs(pts_sf) <- crs_tile
+    pts_sf$used_centroid <- FALSE
+    pts_sf
+  } else {
+    centroid <- st_centroid(tile_sfc)
+    pts_sf <- st_sf(tile_id = top_tiles$tile_id[i], geometry = centroid)
+    st_crs(pts_sf) <- crs_tile
+    pts_sf$used_centroid <- TRUE
+    pts_sf
+  }
+}))
+
+candidate_points <- st_as_sf(candidate_points)
+st_crs(candidate_points) <- CRS_METRIC
+
+```
+
+# 11. Candidate Impact Simulation (Add One School)
+
+```{r simulate-impact}
+evaluate_candidate_impact <- function(candidate_point, school_pts, pop_grid, boundary_sf, crs_metric = CRS_METRIC) {
+  school_pts_m <- st_transform(st_as_sf(school_pts), crs_metric)
+  candidate_m  <- st_transform(candidate_point, crs_metric)
+
+  # Build Voronoi with existing + candidate
+  school_coords <- st_coordinates(school_pts_m)
+  cand_coords   <- st_coordinates(candidate_m)[1, 1:2]
+  all_coords <- unique(rbind(school_coords, cand_coords))
+  mp <- st_sfc(st_multipoint(all_coords), crs = crs_metric)
+  boundary <- st_union(st_transform(boundary_sf, crs_metric))
+  vg <- st_voronoi(mp, envelope = st_geometry(boundary))
+  polys <- st_collection_extract(vg, "POLYGON")
+  if (length(polys) != nrow(all_coords)) return(list(hhi = NA_real_, voronoi = NULL))
+
+  vor_sf <- st_sf(geometry = polys, crs = crs_metric)
+  vor_clip <- st_intersection(vor_sf, boundary)
+
+  # Assign provider id to each tile
+  cent <- st_centroid(vor_clip)
+  pts_sf <- st_sf(school_id = seq_len(nrow(all_coords)),
+                  geometry = st_sfc(lapply(seq_len(nrow(all_coords)), function(i) st_point(all_coords[i, ])), crs = crs_metric))
+  vor_clip$school_id <- st_nearest_feature(cent, pts_sf)
+
+  # Area-weighted population (0–14) per tile
+  POP_2180 <- st_transform(pop_grid, crs_metric) |>
+    dplyr::mutate(cell_id = dplyr::row_number(), cell_area = st_area(geometry))
+  vor_clip <- vor_clip |>
+    dplyr::mutate(tile_id = dplyr::row_number(), tile_area = st_area(geometry))
+  pop_vor <- st_intersection(POP_2180, vor_clip) |>
+    dplyr::mutate(sub_area = st_area(geometry), pop_share = RES_0_14 * (sub_area / cell_area))
+  pop_per_tile <- pop_vor |>
+    st_drop_geometry() |>
+    dplyr::group_by(tile_id) |>
+    dplyr::summarise(pop_tile = sum(pop_share, na.rm = TRUE), .groups = "drop")
+  vor_clip <- vor_clip |>
+    dplyr::left_join(pop_per_tile, by = "tile_id")
+
+  # Tile shares + provider-level HHI
+  sw <- compute_spatially_weighted_hhi(vor_clip, id_col = "school_id")
+  list(hhi = sw$hhi_school, voronoi = sw$vor_sf)
+}
+
+```
+
+# 12. Global Optimization with GenSA (parallel seeds)
+
+```{r gensa}
+city_poly <- st_union(POW_waw) %>% st_transform(CRS_METRIC)
+inside_city <- st_within(candidate_points, city_poly, sparse = FALSE)[,1]
+candidate_points <- candidate_points[inside_city,]
+seed_coords <- st_coordinates(candidate_points)
+
+hhi_objective <- function(coord, school_pts, pop_grid, boundary_sf, city_poly) {
+  pt <- st_sfc(st_point(coord), crs = CRS_METRIC)
+  poly_proj <- st_transform(city_poly, st_crs(pt))
+  if (!as.logical(st_within(pt, poly_proj, sparse = FALSE)[1,1])) return(1e6)
+  candidate_sf <- st_sf(geometry = pt)
+  res <- evaluate_candidate_impact(candidate_sf, school_pts, pop_grid, boundary_sf)
+  if (is.null(res$voronoi) || is.na(res$hhi)) return(1e6)
+  res$hhi
+}
+
+bb <- st_bbox(city_poly)
+lower <- c(bb["xmin"], bb["ymin"])
+upper <- c(bb["xmax"], bb["ymax"])
+
+run_gensa_for_seed <- function(seed) {
+  GenSA(
+    par = seed,
+    fn = function(coord) hhi_objective(coord, primary_school_medoids, POP_WAW, POW_waw, city_poly),
+    lower = lower,
+    upper = upper,
+    control = list(max.call = params$gensa_max_calls, verbose = FALSE)
+  )
+}
+
+cat("Running GenSA in parallel on", nrow(seed_coords), "seeds...\n")
+results <- future.apply::future_lapply(seq_len(nrow(seed_coords)), function(k) {
+  seed <- seed_coords[k, ]
+  opt <- run_gensa_for_seed(seed)
+  list(value = opt$value, par = opt$par)
+})
+
+best_idx <- which.min(sapply(results, function(r) r$value))
+best_hhi <- results[[best_idx]]$value
+best_coord <- results[[best_idx]]$par
+best_candidate <- st_sf(geometry = st_sfc(st_point(best_coord), crs = CRS_METRIC))
+best_result <- evaluate_candidate_impact(best_candidate, primary_school_medoids, POP_WAW, POW_waw)
+
+cat(sprintf("Best candidate HHI: %.6f\n", best_hhi))
+cat("Best candidate (WGS84):\n"); print(st_coordinates(st_transform(best_candidate, CRS_GEO)))
+```
+
+# 13. Before/After Visualization
+
+```{r viz-before-after, fig.width=12, fig.height=6}
+plot_market_share_map_side_by_side <- function(vor_before, vor_after, school_pts, pow_sf, new_school_pt, river, railway) {
+  stopifnot("spatially_weighted_share" %in% names(vor_before),
+            "spatially_weighted_share" %in% names(vor_after),
+            "school_id" %in% names(vor_before),
+            "school_id" %in% names(vor_after))
+
+  # Provider-level HHI (aggregate tile-level S_i by school)
+  hhi_before <- vor_before |>
+    st_drop_geometry() |>
+    dplyr::group_by(school_id) |>
+    dplyr::summarise(S = sum(spatially_weighted_share, na.rm = TRUE), .groups = "drop") |>
+    dplyr::summarise(hhi = sum(S^2, na.rm = TRUE), .groups = "drop") |>
+    dplyr::pull(hhi)
+
+  hhi_after <- vor_after |>
+    st_drop_geometry() |>
+    dplyr::group_by(school_id) |>
+    dplyr::summarise(S = sum(spatially_weighted_share, na.rm = TRUE), .groups = "drop") |>
+    dplyr::summarise(hhi = sum(S^2, na.rm = TRUE), .groups = "drop") |>
+    dplyr::pull(hhi)
+
+  # Color scale by tile S_i for visualization
+  all_shares <- c(vor_before$spatially_weighted_share, vor_after$spatially_weighted_share)
+  n_breaks <- 6
+  share_breaks <- seq(min(all_shares, na.rm = TRUE), max(all_shares, na.rm = TRUE), length.out = n_breaks + 1)
+  share_colors <- colorRampPalette(c("yellow", "purple"))(n_breaks)
+  vor_before$color <- cut(vor_before$spatially_weighted_share, breaks = share_breaks, labels = share_colors, include.lowest = TRUE)
+  vor_after$color  <- cut(vor_after$spatially_weighted_share,  breaks = share_breaks, labels = share_colors, include.lowest = TRUE)
+
+  par(mfrow = c(1, 2), mar = c(1, 1, 4, 1))
+  # BEFORE
+  plot(st_geometry(pow_sf), col = "white", border = "gray30",
+       main = paste0("Before (current)\nHHI (provider): ", formatC(hhi_before, format = "f", digits = 6)))
+  plot(st_geometry(st_transform(vor_before, CRS_GEO)), col = as.character(vor_before$color), border = "black", lwd = 1.1, add = TRUE)
+  plot(st_geometry(st_transform(st_as_sf(school_pts), CRS_GEO)), col = "black", bg = "green", pch = 21, cex = 1.3, add = TRUE)
+  plot(st_geometry(river$osm_lines), col = "steelblue1", lwd = 3, add = TRUE)
+  plot(st_geometry(railway$osm_lines), col = "gray", lwd = 1, add = TRUE)
+
+  # AFTER
+  plot(st_geometry(pow_sf), col = "white", border = "gray30",
+       main = paste0("After (with new school)\nHHI (provider): ", formatC(hhi_after, format = "f", digits = 6)))
+  plot(st_geometry(st_transform(vor_after, CRS_GEO)), col = as.character(vor_after$color), border = "black", lwd = 1.1, add = TRUE)
+  plot(st_geometry(st_transform(st_as_sf(school_pts), CRS_GEO)), col = "black", bg = "green", pch = 21, cex = 1.3, add = TRUE)
+  plot(st_geometry(st_transform(new_school_pt, CRS_GEO)), col = "red", bg = "white", pch = 8, cex = 1.0, lwd = 3, add = TRUE)
+  plot(st_geometry(river$osm_lines), col = "steelblue1", lwd = 3, add = TRUE)
+  plot(st_geometry(railway$osm_lines), col = "gray", lwd = 1, add = TRUE)
+  par(mfrow = c(1, 1))
+}
+
+
+# Ensure voronoi has spatially_weighted_share for both states
+sw_before <- compute_spatially_weighted_hhi(VOR_2180)
+VOR_2180 <- sw_before$vor_sf
+
+plot_market_share_map_side_by_side(
+  vor_before = VOR_2180,
+  vor_after  = best_result$voronoi,
+  school_pts = primary_school_medoids,
+  pow_sf     = POW_waw,
+  new_school_pt = best_candidate,
+  river = river,
+  railway = railway
+)
+```
+
+# 14. Session Info
+
+```{r session}
+sessionInfo()
+```

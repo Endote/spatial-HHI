@@ -1,0 +1,622 @@
+---
+title: "Supermarket Clustering & Spatial Competition"
+author: "Norbert Jaworski"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+params:
+  data_dir: "data"
+  city_name: "Warsaw, Poland"
+  optimal_chain: "Biedronka"
+  medoid_threshold_m: 200
+  cannibalization_m: 500
+  lambda_objective: 0.6
+  cache_chunks: true
+  crs_metric: 2180   # EPSG:2180 (PUWG 1992)
+  crs_geo: 4326      # WGS84
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = params$cache_chunks
+)
+options(scipen = 999)
+set.seed(42)
+```
+
+# 1. Dependencies & Project Hygiene
+
+```{r packages}
+# Install missing packages once (idempotent)
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+
+install_if_missing(c(
+  "sf","dplyr","tidyr","osmdata","spatstat.geom","spdep",
+  "RColorBrewer","units","igraph","purrr","readr","stringr"
+))
+
+# Load libs
+library(sf)
+library(dplyr)
+library(tidyr)
+library(osmdata)
+library(spatstat.geom)
+library(spdep)
+library(RColorBrewer)
+library(units)
+library(igraph)
+library(purrr)
+library(readr)
+library(stringr)
+```
+
+> Tip: consider initializing `renv::init()` in the project root for fully reproducible package versions.
+
+# 2. Paths & CRS
+
+```{r paths}
+DATA_DIR   <- params$data_dir
+CRS_METRIC <- params$crs_metric
+CRS_GEO    <- params$crs_geo
+```
+
+# 3. Reusable Utilities (Functions)
+
+```{r utils}
+# Merge nearby points via medoids to de-duplicate dense OSM nodes
+merge_points_medoid <- function(points_sf, threshold_m = 100, metric_crs = 2180, output_crs = 4326) {
+  points_metric <- st_transform(points_sf, metric_crs)
+  dist_matrix   <- st_distance(points_metric)
+  threshold     <- set_units(threshold_m, "m")
+  adj_matrix    <- (dist_matrix < threshold) & (dist_matrix > set_units(0, "m"))
+  g             <- graph_from_adjacency_matrix(as.matrix(adj_matrix), mode = "undirected", diag = FALSE)
+  comp          <- components(g)
+  clusters      <- comp$membership
+  points_metric$cluster <- clusters
+  medoid_indices <- c()
+  for (cl in sort(unique(clusters))) {
+    idx <- which(points_metric$cluster == cl)
+    if (length(idx) == 1) {
+      medoid_indices <- c(medoid_indices, idx)
+    } else {
+      sub_dm <- as.matrix(dist_matrix[idx, idx])
+      medoid_indices <- c(medoid_indices, idx[which.min(rowSums(sub_dm))])
+    }
+  }
+  st_transform(points_metric[unique(medoid_indices), ], output_crs)
+}
+
+strip_units <- function(x) if ("units" %in% class(x)) as.numeric(x) else x
+normalize01 <- function(x) {
+  x <- strip_units(x)
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(rep(0, length(x)))
+  (x - rng[1]) / (rng[2] - rng[1])
+}
+
+# Pre/Post Voronoi comparison and summary
+compare_pre_post_voronoi <- function(base_points, candidate_point, voronoi_boundary, candidate_index = NA) {
+  base_points      <- base_points %>% dplyr::select(supermarket, geometry) %>% st_transform(CRS_METRIC)
+  candidate_point  <- candidate_point %>% dplyr::select(supermarket, geometry) %>% st_transform(CRS_METRIC)
+  voronoi_boundary <- st_transform(voronoi_boundary, CRS_METRIC) %>% st_make_valid()
+  boundary_union   <- st_union(voronoi_boundary) %>% st_make_valid()
+
+  # PRE
+  pre_tiles <- st_union(st_geometry(base_points)) %>%
+    st_voronoi(envelope = boundary_union) %>%
+    st_collection_extract("POLYGON") %>%
+    st_sf(crs = CRS_METRIC) %>%
+    st_make_valid() %>%
+    st_intersection(boundary_union) %>%
+    assign_chain_to_polys(base_points) %>%
+    dplyr::rename(chain = supermarket) %>%
+    dplyr::mutate(source = "Pre", tile_area = st_area(geometry))
+
+  # POST
+  all_points <- rbind(base_points, candidate_point)
+  post_tiles <- st_union(st_geometry(all_points)) %>%
+    st_voronoi(envelope = boundary_union) %>%
+    st_collection_extract("POLYGON") %>%
+    st_sf(crs = CRS_METRIC) %>%
+    st_make_valid() %>%
+    st_intersection(boundary_union) %>%
+    assign_chain_to_polys(all_points) %>%
+    dplyr::rename(chain = supermarket) %>%
+    dplyr::mutate(source = "Post", tile_area = st_area(geometry))
+
+  combined <- dplyr::bind_rows(pre_tiles, post_tiles)
+
+  combined %>%
+    st_drop_geometry() %>%
+    dplyr::group_by(chain, source) %>%
+    dplyr::summarise(area = sum(tile_area, na.rm = TRUE), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = source, values_from = area) %>%
+    tidyr::complete(chain = c("Lidl", "Biedronka"), fill = list(Pre = NA, Post = NA)) %>%
+    dplyr::mutate(
+      area_pre = as.numeric(Pre),
+      area_post= as.numeric(Post),
+      area_diff= area_post - area_pre,
+      percent_change = ifelse(!is.na(area_pre) & area_pre > 0, 100 * area_diff/area_pre, NA),
+      candidate = candidate_index
+    ) %>%
+    dplyr::select(candidate, chain, area_pre, area_post, area_diff, percent_change)
+}
+
+
+# Compute biased centroid towards competitor population and away from own stores
+compute_weighted_centroid <- function(tile_id, tile_geom, nb_list, all_tiles, chain) {
+  neighbors <- nb_list[[tile_id]]
+  if (length(neighbors) == 0) return(st_centroid(tile_geom))
+  chain_vec <- all_tiles$supermarket[neighbors]
+  pop_vec   <- all_tiles$pop_tile[neighbors]
+  coords    <- st_coordinates(st_centroid(all_tiles[neighbors, ]))
+  attract_idx <- which(chain_vec != chain)
+  repel_idx   <- which(chain_vec == chain)
+  if (length(attract_idx) == 0) return(st_centroid(tile_geom))
+  attract_weights <- as.numeric(pop_vec[attract_idx])
+  repel_weights   <- as.numeric(pop_vec[repel_idx])
+  attract_coords  <- coords[attract_idx, , drop = FALSE]
+  weighted_attract<- colSums(attract_coords * attract_weights) / sum(attract_weights)
+  if (length(repel_weights) > 0) {
+    repel_coords   <- coords[repel_idx, , drop = FALSE]
+    weighted_repel <- colSums(repel_coords * repel_weights) / sum(repel_weights)
+    combined_coords<- weighted_attract + (weighted_attract - weighted_repel)
+  } else {
+    combined_coords<- weighted_attract
+  }
+  st_point(combined_coords)
+}
+
+safe_sanitize_geometry <- function(geom, vor_layer) {
+  if (inherits(geom, "sfc") && length(geom) == 0) return(st_point(c(21, 52)))
+  tryCatch({
+    if (st_is_empty(geom) || any(is.na(st_bbox(geom))) || any(is.na(st_coordinates(geom)))) {
+      intersects <- st_intersects(geom, vor_layer, sparse = FALSE)
+      if (any(intersects)) {
+        return(st_centroid(vor_layer$geometry[which(intersects)[1]]))
+      } else return(st_point(c(21, 52)))
+    } else geom
+  }, error = function(e) st_point(c(21, 52)))
+}
+
+assign_chain_to_polys <- function(polys, pts) {
+  polys <- sf::st_make_valid(polys)
+  pts   <- sf::st_make_valid(pts)
+
+  j <- sf::st_join(polys, pts %>% dplyr::select(supermarket), join = sf::st_contains)
+
+  na_idx <- which(is.na(j$supermarket))
+  if (length(na_idx)) {
+    nn <- sf::st_nearest_feature(j[na_idx, ], pts)
+    j$supermarket[na_idx] <- pts$supermarket[nn]
+  }
+  j
+}
+```
+
+# 4. Boundaries & Population Grid
+
+```{r boundaries}
+# Powiaty & Warsaw districts
+POW <- st_read(file.path(DATA_DIR, "powiaty/powiaty.shp"), stringsAsFactors = FALSE)
+POW$jpt_nazwa_ <- iconv(POW$jpt_nazwa_, "latin1", "UTF-8")
+POW <- st_transform(POW, CRS_GEO)
+POW_waw <- POW[POW$jpt_nazwa_ == "powiat Warszawa", ]
+
+WAW <- st_read(file.path(DATA_DIR, "dzielnice_Warszawy/dzielnice_Warszawy.shp")) %>%
+  st_transform(CRS_GEO)
+
+# Population grid (pre-clipped to Warsaw)
+POP_WAW <- st_read(file.path(DATA_DIR, "POP.WAW/POP.WAW.shp"))
+```
+
+# 5. OSM Context Layers (rivers, rails)
+
+```{r osm-context}
+warsaw_bbox <- getbb(params$city_name)
+river <- warsaw_bbox %>% opq() %>% add_osm_feature(key = "waterway", value = "river") %>% osmdata_sf()
+railway <- warsaw_bbox %>% opq() %>% add_osm_feature(key = "railway", value = "rail") %>% osmdata_sf()
+```
+
+# 6. Supermarket POIs (Biedronka & Lidl) + Medoids
+
+```{r supermarkets}
+# Helper: read WKT CSV -> sf, set CRS, align to WAW CRS, clip to WAW
+read_wkt_points <- function(path, waw = WAW) {
+  df  <- readr::read_csv(path, col_types = readr::cols(.default = readr::col_character()))
+  pts <- sf::st_as_sf(df, wkt = "WKT", crs = 4326)   # OSM = EPSG:4326
+
+  # --- normalize geometry column name to 'geometry'
+  pts <- dplyr::rename(pts, geometry = WKT)
+  sf::st_geometry(pts) <- "geometry"
+
+  # align CRS to WAW for clipping
+  pts <- sf::st_transform(pts, sf::st_crs(waw))
+  sf::st_intersection(pts, waw)
+}
+
+
+# Biedronka
+b_points <- read_wkt_points("data/biedronka_points_wkt.csv") %>%
+  dplyr::mutate(supermarket = "Biedronka")
+
+biedronka_medoids <- merge_points_medoid(
+  b_points,
+  threshold_m = params$medoid_threshold_m,
+  metric_crs  = CRS_METRIC,
+  output_crs  = CRS_GEO
+)
+
+# Lidl
+l_points <- read_wkt_points("data/lidl_points_wkt.csv") %>%
+  dplyr::mutate(supermarket = "Lidl")
+
+lidl_medoids <- merge_points_medoid(
+  l_points,
+  threshold_m = params$medoid_threshold_m,
+  metric_crs  = CRS_METRIC,
+  output_crs  = CRS_GEO
+)
+
+# Combined & clipped to WAW (ensure final CRS = GEO if that's your map CRS)
+supermarket_points <- dplyr::bind_rows(biedronka_medoids, lidl_medoids) %>%
+  sf::st_transform(sf::st_crs(WAW)) %>%
+  sf::st_intersection(WAW)
+```
+
+# 7. Voronoi Tessellation (clipped)
+
+```{r voronoi}
+points_sf     <- st_transform(supermarket_points, CRS_METRIC)
+city_boundary <- st_transform(POW_waw, CRS_METRIC)
+city_envelope <- st_union(city_boundary)
+
+voronoi_geom <- points_sf %>% st_geometry() %>% st_union() %>% st_voronoi(envelope = st_geometry(city_envelope))
+voronoi_polys <- st_collection_extract(voronoi_geom, "POLYGON") %>% st_sf(crs = st_crs(city_boundary))
+VOR_2180 <- st_intersection(voronoi_polys, city_boundary) %>%
+  mutate(tile_id = dplyr::row_number(), tile_area = st_area(geometry))
+```
+
+# 8. Population per Voronoi Tile
+
+```{r pop-per-voronoi}
+POP_2180 <- st_transform(POP_WAW, CRS_METRIC) %>%
+  mutate(cell_id = dplyr::row_number(), cell_area = st_area(geometry))
+
+supermarket_points_2180 <- st_transform(supermarket_points, CRS_METRIC)
+
+pop_vor <- st_intersection(POP_2180, VOR_2180) %>%
+  mutate(sub_area = st_area(geometry), pop_share = RES * (sub_area / cell_area))
+
+pop_per_tile <- pop_vor %>% st_drop_geometry() %>%
+  group_by(tile_id) %>% summarise(pop_tile = sum(pop_share, na.rm = TRUE))
+
+VOR_2180 <- VOR_2180 %>% left_join(pop_per_tile, by = "tile_id") %>%
+  mutate(cell_area_km2 = as.numeric(tile_area) / 1e6,
+         pop_density   = as.numeric(pop_tile) / cell_area_km2) %>%
+  st_join(supermarket_points_2180 %>% dplyr::select(supermarket), join = st_contains)
+```
+
+# 9. Spatially Weighted Shares & HHI
+
+```{r shares-hhi}
+# total pop
+TOTAL_POP <- sum(VOR_2180$pop_tile, na.rm = TRUE)
+# normalized spatial weights
+VOR_2180 <- VOR_2180 %>% mutate(spatial_weight = pop_density / sum(pop_density, na.rm = TRUE))
+
+# each tile has its store via join above
+individual_supermarket_shares <- VOR_2180 %>% st_drop_geometry() %>%
+  mutate(supermarket_point_share = pop_tile / TOTAL_POP,
+         weighted_share = supermarket_point_share * spatial_weight,
+         norm_spatial_weighted_share = weighted_share / sum(weighted_share, na.rm = TRUE)) %>%
+  dplyr::select(tile_id, supermarket, pop_tile, spatial_weight, supermarket_point_share, norm_spatial_weighted_share)
+
+# attach back to store points (assign tile ids deterministically by spatial join)
+supermarket_points_2180 <- supermarket_points_2180 %>% mutate(tile_id = dplyr::row_number()) %>%
+  left_join(individual_supermarket_shares %>% dplyr::select(tile_id, norm_spatial_weighted_share), by = "tile_id")
+
+chain_shares <- individual_supermarket_shares %>% group_by(supermarket) %>%
+  summarise(chain_norm_spatial_share = sum(norm_spatial_weighted_share, na.rm = TRUE), .groups = "drop")
+
+spatial_HHI <- chain_shares %>% summarise(HHI = sum(chain_norm_spatial_share^2)) %>% pull(HHI)
+cat("Spatially Weighted HHI:", round(spatial_HHI, 6), "\n")
+```
+
+# 10. Visualization — Spatially Weighted Share (Sᵢ)
+
+```{r viz-weighted, fig.width=10, fig.height=7}
+VOR_4326 <- st_transform(VOR_2180, CRS_GEO)
+supermarket_points_geo <- st_transform(supermarket_points_2180, CRS_GEO)
+
+share_vals   <- supermarket_points_geo$norm_spatial_weighted_share
+n_breaks     <- 5
+share_breaks <- seq(min(share_vals, na.rm = TRUE), max(share_vals, na.rm = TRUE), length.out = n_breaks + 1)
+share_colors <- colorRampPalette(c("yellow", "purple"))(n_breaks)
+
+# transfer point shares to tiles by tile_id
+VOR_4326 <- VOR_4326 %>% left_join(
+  supermarket_points_geo %>% st_drop_geometry() %>% dplyr::select(tile_id, norm_spatial_weighted_share), by = "tile_id"
+)
+VOR_4326$color <- cut(VOR_4326$norm_spatial_weighted_share, breaks = share_breaks, labels = share_colors, include.lowest = TRUE)
+
+plot(st_geometry(POW_waw), col = "azure", border = "cyan3", lwd = 3,
+     main = "Market Share by Population with Spatial Weighting (Sᵢ)", reset = FALSE)
+plot(st_geometry(VOR_4326), col = as.character(VOR_4326$color), border = "black", lwd = 1.2, add = TRUE)
+plot(st_geometry(river$osm_lines), col = "steelblue1", lwd = 3, add = TRUE)
+plot(st_geometry(railway$osm_lines), col = "gray", lwd = 1, add = TRUE)
+col_map <- ifelse(supermarket_points_geo$supermarket == "Biedronka", "red", "blue")
+plot(st_geometry(supermarket_points_geo), col = "black", pch = 21, bg = col_map, cex = 1.8, add = TRUE)
+legend("bottomleft", legend = paste(round(share_breaks[-length(share_breaks)], 4), "to", round(share_breaks[-1], 4)),
+       fill = share_colors, title = "Spatial Weighted Share Sᵢ", bty = "n", cex = 0.8)
+legend("bottomright", legend = c("Biedronka", "Lidl"), pch = 21, pt.bg = c("red", "blue"), pt.cex = 2, bty = "n")
+box()
+```
+
+# 11. Visualization — Raw Population Share per Tile (Pᵢ)
+
+```{r viz-raw, fig.width=10, fig.height=7}
+VOR_4326_raw <- VOR_2180 %>% mutate(Pi = pop_tile / sum(pop_tile, na.rm = TRUE)) %>% st_transform(CRS_GEO)
+share_vals   <- VOR_4326_raw$Pi
+n_breaks     <- 5
+share_breaks <- seq(min(share_vals, na.rm = TRUE), max(share_vals, na.rm = TRUE), length.out = n_breaks + 1)
+share_colors <- colorRampPalette(c("yellow", "purple"))(n_breaks)
+VOR_4326_raw$color <- cut(VOR_4326_raw$Pi, breaks = share_breaks, labels = share_colors, include.lowest = TRUE)
+
+plot(st_geometry(POW_waw), col = "azure", border = "cyan3", lwd = 3,
+     main = "Raw Population Share per Voronoi Tile (Pᵢ)", reset = FALSE)
+plot(st_geometry(VOR_4326_raw), col = as.character(VOR_4326_raw$color), border = "black", lwd = 1.2, add = TRUE)
+plot(st_geometry(river$osm_lines), col = "steelblue1", lwd = 3, add = TRUE)
+plot(st_geometry(railway$osm_lines), col = "gray", lwd = 1, add = TRUE)
+col_map <- ifelse(supermarket_points_geo$supermarket == "Biedronka", "red", "blue")
+plot(st_geometry(supermarket_points_geo), col = "black", pch = 21, bg = col_map, cex = 1.8, add = TRUE)
+legend("bottomleft", legend = paste(round(share_breaks[-length(share_breaks)], 5), "to", round(share_breaks[-1], 5)),
+       fill = share_colors, title = "Raw Population Share Pᵢ", bty = "n", cex = 0.8)
+legend("bottomright", legend = c("Biedronka", "Lidl"), pch = 21, pt.bg = c("red", "blue"), pt.cex = 2, bty = "n")
+box()
+```
+
+# 12. Candidate Generation — Smart Biased Centroids
+
+```{r candidates}
+# neighbors on tiles
+nb <- poly2nb(VOR_2180, queen = TRUE)
+
+# neighbor border scores
+nb_df <- data.frame(
+  tile_id = rep(1:length(nb), sapply(nb, length)),
+  neighbor_id = unlist(nb)
+) %>%
+  left_join(VOR_2180 %>% dplyr::select(tile_id, supermarket, pop_tile), by = "tile_id") %>%
+  left_join(VOR_2180 %>% dplyr::select(tile_id, supermarket, pop_tile), by = c("neighbor_id" = "tile_id"), suffix = c("_tile", "_neighbor")) %>%
+  mutate(competitor = supermarket_tile != supermarket_neighbor)
+
+border_scores <- nb_df %>% group_by(tile_id) %>% summarise(
+  n_total = dplyr::n(),
+  n_competitor = sum(competitor, na.rm = TRUE),
+  border_strength = n_competitor / n_total,
+  pop_gain = sum(pop_tile_neighbor[competitor], na.rm = TRUE)
+) %>% mutate(weighted_gain = border_strength * pop_gain)
+
+pop_thresh <- quantile(VOR_2180$pop_tile, 0.2, na.rm = TRUE)
+optimal_chain <- params$optimal_chain
+
+valid_tiles <- VOR_2180 %>% left_join(border_scores, by = "tile_id") %>%
+  filter(supermarket != optimal_chain, n_total > 2, pop_tile > pop_thresh)
+
+suggested_points <- lapply(1:nrow(valid_tiles), function(i) {
+  tile_id <- valid_tiles$tile_id[i]
+  tile_geom <- valid_tiles$geometry[i]
+  compute_weighted_centroid(tile_id, tile_geom, nb, VOR_2180, optimal_chain)
+})
+
+suggested_points_clean <- Filter(function(pt) inherits(pt, "sfg"), suggested_points)
+stopifnot(length(suggested_points_clean) > 0)
+
+suggested_locations <- st_sf(
+  supermarket = rep(optimal_chain, length(suggested_points_clean)),
+  geometry = st_sfc(suggested_points_clean, crs = st_crs(VOR_2180))
+)
+
+# Keep only in competitor territory & avoid cannibalization
+intersection_matrix <- st_intersects(suggested_locations, VOR_2180, sparse = FALSE)
+intersected_tile_ids <- apply(intersection_matrix, 1, function(row) which(row)[1])
+assigned_chains <- VOR_2180$supermarket[intersected_tile_ids]
+
+suggested_locations$valid <- apply(intersection_matrix, 1, function(row) any(VOR_2180$supermarket[row] != optimal_chain))
+suggested_locations <- suggested_locations[suggested_locations$valid %in% TRUE, ]
+
+# Score components
+suggested_locations <- st_transform(suggested_locations, st_crs(VOR_2180))
+
+# Distances to existing stores of the same (optimal) chain
+same_chain_pts <- supermarket_points_2180[supermarket_points_2180$supermarket == optimal_chain, ]
+if (nrow(same_chain_pts) == 0) {
+  stop(sprintf("No existing %s stores found to compute cannibalization distance.", optimal_chain))
+}
+
+dist_matrix <- st_distance(suggested_locations, same_chain_pts)  # units: m
+
+# Row-wise minima -> reattach units explicitly (apply tends to drop them)
+min_dist_same_chain <- units::set_units(
+  apply(dist_matrix, 1, function(row) as.numeric(min(row, na.rm = TRUE))),
+  "m"
+)
+
+# Units-aware threshold and filtering
+thresh <- units::set_units(params$cannibalization_m, "m")
+keep_idx <- min_dist_same_chain > thresh
+
+# If everything got filtered out, bail early with a helpful message
+if (!any(keep_idx)) {
+  stop(sprintf(
+    "All candidates filtered by cannibalization threshold (%.0f m). Try lowering params$cannibalization_m.",
+    as.numeric(thresh)
+  ))
+}
+
+suggested_locations <- suggested_locations[keep_idx, ]
+min_dist_same_chain <- min_dist_same_chain[keep_idx]
+
+
+assigned_tiles <- st_join(suggested_locations, VOR_2180 %>% dplyr::select(tile_id, pop_tile, pop_density, supermarket), join = st_within)
+assigned_tiles <- assigned_tiles[!duplicated(st_geometry(assigned_tiles)), ]
+stopifnot(nrow(assigned_tiles) == nrow(suggested_locations))
+
+suggested_locations <- suggested_locations %>%
+  mutate(candidate_id = row_number())
+suggested_locations$tile_id        <- assigned_tiles$tile_id
+suggested_locations$pop_tile       <- assigned_tiles$pop_tile
+suggested_locations$pop_density    <- assigned_tiles$pop_density
+suggested_locations$min_dist_same  <- min_dist_same_chain
+suggested_locations$border_score   <- border_scores$weighted_gain[match(suggested_locations$tile_id, border_scores$tile_id)]
+
+suggested_locations$score_border  <- normalize01(suggested_locations$border_score)
+suggested_locations$score_pop     <- normalize01(suggested_locations$pop_tile)
+suggested_locations$score_isolate <- normalize01(suggested_locations$min_dist_same)
+
+alpha <- 0.3; beta <- 0.3; gamma <- 0.4
+suggested_locations$composite_score <- with(suggested_locations, alpha*score_border + beta*score_pop + gamma*score_isolate)
+
+top_6 <- suggested_locations %>% arrange(desc(composite_score)) %>% slice_head(n = 6)
+print(top_6)
+```
+
+# 13. Candidate Evaluation (Objective Function)
+
+```{r evaluate}
+lambda <- params$lambda_objective
+
+evaluate_candidates <- function(top_k_candidates, base_points, boundary) {
+  summary_list <- list()
+  for (i in seq_len(nrow(top_k_candidates))) {
+    candidate <- top_k_candidates[i, ]
+    candidate_id_val <- candidate$candidate_id[[1]]
+
+    area_summary <- tryCatch({
+      compare_pre_post_voronoi(base_points, candidate, boundary, candidate_index = candidate_id_val)
+    }, error = function(e) NULL)
+    if (is.null(area_summary) || nrow(area_summary) == 0) next
+
+    lidl_row <- area_summary %>% filter(chain == "Lidl")
+    if (nrow(lidl_row) == 0) next
+    area_gain <- as.numeric(lidl_row$percent_change)
+
+    # Build post scenario tessellation
+    common_cols <- intersect(names(base_points), names(candidate))
+    all_points <- rbind(base_points[, common_cols], candidate[, common_cols])
+    boundary_union <- st_union(boundary)
+    vor_geom <- st_union(st_geometry(all_points)) %>% st_voronoi(envelope = boundary_union)
+    post_tiles <- st_collection_extract(vor_geom, "POLYGON") %>%
+      st_sf(crs = st_crs(boundary)) %>% st_intersection(boundary_union)
+
+    post_tiles$tile_id <- seq_len(nrow(post_tiles))        # <-- fixed
+    post_tiles$tile_area <- st_area(post_tiles)
+    post_tiles <- st_join(post_tiles, all_points, join = st_contains)
+    if (sum(!is.na(post_tiles$supermarket)) == 0) next
+
+    post_tiles <- post_tiles %>%
+      filter(!is.na(supermarket)) %>%
+      st_join(POP_2180, join = st_intersects)
+    if (nrow(post_tiles) == 0) next
+
+    post_tiles$tile_id <- seq_len(nrow(post_tiles))        # <-- fixed
+    post_tiles <- post_tiles %>%
+      mutate(sub_area = st_area(geometry),
+             pop_share = RES * (sub_area / cell_area)) %>%
+      group_by(tile_id, supermarket) %>%
+      summarise(pop_tile = sum(pop_share, na.rm = TRUE), .groups = "drop")
+
+    post_tiles$tile_area     <- st_area(post_tiles)
+    post_tiles$pop_density   <- post_tiles$pop_tile / (as.numeric(post_tiles$tile_area) / 1e6)
+    post_tiles$spatial_weight<- post_tiles$pop_density / sum(post_tiles$pop_density, na.rm = TRUE)
+    post_tiles$spatial_share <- post_tiles$spatial_weight * (post_tiles$pop_tile / sum(post_tiles$pop_tile, na.rm = TRUE))
+
+    new_share <- post_tiles %>% group_by(supermarket) %>%
+      summarise(norm_spatial_share = sum(spatial_share, na.rm = TRUE), .groups = "drop") %>%
+      filter(supermarket == "Lidl") %>% pull(norm_spatial_share)
+
+    pre_share <- chain_shares %>% filter(supermarket == "Lidl") %>% pull(chain_norm_spatial_share)
+    spatial_gain <- as.numeric(100 * (new_share - pre_share) / pre_share)
+
+    area_summary <- area_summary %>%
+      mutate(percent_change_spatial_weight = ifelse(chain == "Lidl", spatial_gain, NA),
+             objective_score = ifelse(chain == "Lidl", params$lambda_objective * spatial_gain +
+                                                 (1 - params$lambda_objective) * area_gain, NA),
+             candidate = candidate_id_val)
+
+    summary_list[[i]] <- area_summary %>% st_drop_geometry()
+  }
+  if (!length(summary_list)) return(NULL)
+  bind_rows(summary_list) %>% filter(chain == "Lidl") %>% arrange(desc(objective_score))
+}
+
+
+# Evaluate
+supermarket_points_2180_eval <- st_transform(supermarket_points, CRS_METRIC)
+POW_waw_2180 <- st_transform(POW_waw, CRS_METRIC)
+
+optimized_summary <- evaluate_candidates(top_k_candidates = st_transform(suggested_locations, CRS_METRIC),
+                                         base_points = supermarket_points_2180_eval,
+                                         boundary = POW_waw_2180)
+
+if (!is.null(optimized_summary)) {
+  print(head(optimized_summary, 10))
+  optimized_summary <- optimized_summary %>%
+    arrange(desc(objective_score)) %>% mutate(rank_area = dplyr::row_number()) %>%
+    arrange(desc(percent_change_spatial_weight)) %>% mutate(rank_spatial = dplyr::row_number()) %>%
+    mutate(rank_objective = dplyr::row_number()) %>%
+    mutate(combined_rank_score = 0.3*rank_area + 0.4*rank_spatial + 0.3*rank_objective) %>%
+    arrange(combined_rank_score)
+}
+
+```
+
+# 14. Map — Top 10 Candidate Points
+
+```{r map-top10, fig.width=10, fig.height=7}
+if (!is.null(optimized_summary) && nrow(optimized_summary) > 0) {
+  VOR_plot <- st_transform(VOR_2180, CRS_GEO)
+  top_10_ids <- optimized_summary$candidate[1:min(10, nrow(optimized_summary))]
+  top_10 <- suggested_locations %>%
+    dplyr::filter(candidate_id %in% top_10_ids) %>%
+    st_transform(CRS_GEO)
+
+  # sanitize geoms (safety)
+  safe_geoms <- purrr::map(top_10$geometry, safe_sanitize_geometry, vor_layer = VOR_plot)
+  top_10$geometry <- st_sfc(safe_geoms, crs = CRS_GEO)
+  top_10 <- top_10 %>%
+    dplyr::filter(!st_is_empty(geometry)) %>%
+    dplyr::filter(!is.na(st_coordinates(.)[,1]))
+
+  plot(st_geometry(POW_waw), col = "white", border = "gray20", lwd = 1.5, main = "Top Candidate Locations")
+  plot(st_geometry(VOR_plot), col = adjustcolor("lightgray", alpha.f = 0.4), border = "black", add = TRUE)
+
+  pts_geo <- st_transform(supermarket_points, CRS_GEO)
+  col_map <- ifelse(pts_geo$supermarket == "Lidl", "blue", "red")
+  plot(st_geometry(pts_geo), col = "black", bg = col_map, pch = 21, cex = 1.5, add = TRUE)
+
+  plot(st_geometry(top_10), col = "black", bg = "green", pch = 24, cex = 1.8, lwd = 2, add = TRUE)
+  text(st_coordinates(top_10)[,1], st_coordinates(top_10)[,2],
+       labels = match(top_10$candidate_id, top_10_ids), pos = 3, cex = 0.9, col = "darkgreen")
+  box()
+  print(top_10)
+}
+```
+
+# 15. Session Info
+
+```{r session}
+sessionInfo()
+```
