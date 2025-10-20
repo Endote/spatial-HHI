@@ -1,6 +1,6 @@
 ---
 title: "Primary Schools: Access, Voronoi & Spatial Competition"
-author: "Norbert Jaworski"
+author: ""
 date: "`r format(Sys.Date())`"
 output:
   html_document:
