@@ -169,9 +169,9 @@ read_wkt_points <- function(path, waw = WAW) {
 # --- Usage (adjust the file name to yours) ---
 # Example: saved earlier via st_write(..., layer_options="GEOMETRY=AS_WKT")
 # e.g., "data/schools_points_wkt.csv"
-primary_school_medoids <- get_primary_school_points_from_wkt(
-  path   = "data/school_points_wkt.csv",
-  waw_sf = WAW
+primary_school_medoids <- read_wkt_points(
+  path   = "data/school_points_wkt.csv"
+  #waw_sf = WAW
 )
 
 stopifnot(!is.null(primary_school_medoids), nrow(primary_school_medoids) > 0)
